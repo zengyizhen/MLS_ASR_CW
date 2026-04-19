@@ -221,8 +221,9 @@ def apply_rotary_pos_emb(
         cos = cos[:, :half_dim]
         sin = sin[:, :half_dim]
 
-    cos = cos.to(torch.float32).contiguous()
-    sin = sin.to(torch.float32).contiguous()
+    rope_dtype = q.dtype
+    cos = cos.to(rope_dtype).contiguous()
+    sin = sin.to(rope_dtype).contiguous()
 
     q_out = _apply_rope_single(q, cos, sin, half_dim, head_dim)
     k_out = _apply_rope_single(k, cos, sin, half_dim, head_dim)

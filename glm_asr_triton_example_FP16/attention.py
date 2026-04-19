@@ -274,6 +274,14 @@ def scaled_dot_product_attention(
     batch, num_heads, seq_q, head_dim = q.shape
     _, _, seq_k, _ = k.shape
 
+    # Keep Q/K/V aligned to one compute dtype so einsum/matmul paths don't
+    # fail after FP16 weight loading.
+    attn_dtype = q.dtype
+    if k.dtype != attn_dtype:
+        k = k.to(attn_dtype)
+    if v.dtype != attn_dtype:
+        v = v.to(attn_dtype)
+
     if scale is None:
         scale = 1.0 / np.sqrt(head_dim)
 
@@ -357,10 +365,12 @@ def scaled_dot_product_attention(
                 attention_mask = attention_mask.reshape(
                     batch * num_heads, seq_q, seq_k
                 )
+            if attention_mask.dtype != scores.dtype:
+                attention_mask = attention_mask.to(scores.dtype)
             if seq_k_padded != seq_k:
                 mask_padded = torch.zeros(
                     (batch * num_heads, seq_q, seq_k_padded),
-                    dtype=torch.float32,
+                    dtype=scores.dtype,
                     device=q.device,
                 )
                 mask_padded[:, :, :seq_k] = attention_mask
@@ -403,12 +413,14 @@ def scaled_dot_product_attention(
 
     if is_causal:
         mask = torch.triu(
-            torch.ones((seq_q, seq_k), dtype=torch.float32, device=q.device),
+            torch.ones((seq_q, seq_k), dtype=scores.dtype, device=q.device),
             diagonal=1,
         ) * -1e9
         scores = scores + mask[None, None, :, :]
 
     if attention_mask is not None:
+        if attention_mask.dtype != scores.dtype:
+            attention_mask = attention_mask.to(scores.dtype)
         scores = scores + attention_mask
 
     scores = scores - torch.max(scores, dim=-1, keepdim=True).values
