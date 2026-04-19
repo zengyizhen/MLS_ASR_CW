@@ -733,6 +733,11 @@ class GlmAsrModel:
     ) -> torch.Tensor:
         """Generate tokens from audio with proper chat template format.
 
+        IMPORTANT:
+        This path now uses KV cache during autoregressive decoding.
+        We do one full "prefill" pass for the initial prompt, then only feed
+        the newly generated token embedding on each subsequent step.
+
         Args:
             input_features: (batch, mel_bins, time) mel spectrogram
             input_ids: (batch, seq_len) token IDs with audio placeholders (<|pad|>)
@@ -796,13 +801,19 @@ class GlmAsrModel:
             batch_size = audio_embeds.shape[0] if audio_embeds.ndim == 3 else 1
             if audio_embeds.ndim == 2:
                 audio_embeds = audio_embeds[None, :, :]
-            inputs_embeds = audio_embeds
             generated = torch.full(
                 (batch_size, 1),
                 self.config.bos_token_id,
                 dtype=torch.int64,
-                device=inputs_embeds.device,
+                device=audio_embeds.device,
             )
+            # IMPORTANT:
+            # When there is no textual prompt, generation should still start
+            # from BOS in the model context. Without this concatenation, the
+            # returned `generated` tokens and the decoder's actual context
+            # would be inconsistent.
+            bos_embeds = self.text_decoder.embed_tokens(generated)
+            inputs_embeds = torch.cat([audio_embeds, bos_embeds], dim=1)
 
         # Track which sequences have finished (hit EOS)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=generated.device)
@@ -815,10 +826,23 @@ class GlmAsrModel:
             eos_token_ids, dtype=torch.int64, device=generated.device
         )
 
-        # Autoregressive generation
+        # =====================================================================
+        # IMPORTANT: KV-CACHE PREFILL
+        # Run the decoder once on the full prompt (audio + optional text
+        # prompt) so every decoder layer returns its initial K/V cache.
+        # =====================================================================
+        logits, past_key_values = self.decode(
+            inputs_embeds=inputs_embeds,
+            use_cache=True,
+        )
+
+        # =====================================================================
+        # IMPORTANT: KV-CACHE DECODE LOOP
+        # From this point on, we only feed the embedding of the newly generated
+        # token. All previous context is reused from `past_key_values`.
+        # =====================================================================
         for _ in range(max_new_tokens):
-            # Get logits for next token
-            logits = self.decode(inputs_embeds=inputs_embeds)
+            # Get logits for the next token from the most recent decoder output.
             next_token_logits = logits[:, -1, :] / temperature
 
             # Top-k sampling
@@ -859,8 +883,15 @@ class GlmAsrModel:
             if torch.all(finished):
                 break
 
-            # Update inputs_embeds with new token
+            # IMPORTANT:
+            # Incremental decode step. Only the new token embedding is fed
+            # back into the decoder; all previous sequence state lives inside
+            # `past_key_values`.
             new_embeds = self.text_decoder.embed_tokens(next_token)
-            inputs_embeds = torch.cat([inputs_embeds, new_embeds], dim=1)
+            logits, past_key_values = self.decode(
+                inputs_embeds=new_embeds,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
 
         return generated
