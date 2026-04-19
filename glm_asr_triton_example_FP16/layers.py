@@ -756,6 +756,8 @@ class Embedding:
         if self.weight.device != input_ids.device:
             self.weight = self.weight.to(input_ids.device)
 
+        output_dtype = self.weight.dtype
+
         if not input_ids.is_cuda:
             flat = input_ids.reshape(-1).to(torch.int64)
             output = self.weight.index_select(0, flat)
@@ -763,7 +765,7 @@ class Embedding:
 
         indices_flat = input_ids.reshape(-1).to(torch.int32).contiguous()
         output = torch.empty(
-            (batch_size, self.embedding_dim), dtype=torch.float32, device=indices_flat.device
+            (batch_size, self.embedding_dim), dtype=output_dtype, device=indices_flat.device
         )
 
         block = 256
