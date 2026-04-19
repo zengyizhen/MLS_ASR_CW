@@ -535,7 +535,7 @@ class TextDecoder:
         self,
         batch_size: int,
         max_seq_len: int,
-        dtype=torch.float32,
+        dtype=None,
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Allocate KV buffers for all layers.
 
@@ -548,6 +548,8 @@ class TextDecoder:
         kv_buffers = []
         device = getattr(self.embed_tokens, "weight", None)
         device = device.device if device is not None else None
+        if dtype is None:
+            dtype = self.embed_tokens.weight.dtype
         for _ in range(self.num_layers):
             key_buffer = torch.zeros(
                 (batch_size, num_kv_heads, max_seq_len, head_dim),

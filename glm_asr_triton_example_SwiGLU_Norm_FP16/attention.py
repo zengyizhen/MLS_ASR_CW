@@ -284,6 +284,13 @@ def scaled_dot_product_attention(
     if scale is None:
         scale = 1.0 / np.sqrt(head_dim)
 
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        common_dtype = q.dtype
+        if common_dtype != k.dtype:
+            k = k.to(common_dtype)
+        if common_dtype != v.dtype:
+            v = v.to(common_dtype)
+
     seq_k_padded = next_power_of_two(seq_k)
     head_dim_padded = next_power_of_two(head_dim)
 
