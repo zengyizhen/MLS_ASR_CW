@@ -651,12 +651,16 @@ class Linear:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         backend = self.backend if self.backend is not None else Linear.BACKEND
+        M = int(np.prod(x.shape[:-1]))
+        op_kind = "GEMV" if M == 1 else "GEMM"
+        print(
+            f"[Linear] x_shape={tuple(x.shape)} M={M} K={self.in_features} N={self.out_features} op={op_kind} backend={backend}"
+        )
         if backend in ("torch", "cublas"):
             return self._forward_torch(x)
         if backend == "triton":
             return self._forward_triton(x)
-        
-        M = int(np.prod(x.shape[:-1]))
+
         if M >= self.TILE_M and x.is_cuda:
             return self._forward_triton(x)
         return self._forward_torch(x)
