@@ -256,7 +256,7 @@ def benchmark_triton_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
     if 'example' in folder_name.lower():
         print("Applying baseline configuration (example)...")
         layers = importlib.import_module("layers")
-        layers.Linear.BACKEND = 'cublas'
+        layers.Linear.BACKEND = 'triton'#'cublas'
         layers.MLP.FUSED = True
         if hasattr(layers, 'EncoderMLP'):
             layers.EncoderMLP.FUSED = False
