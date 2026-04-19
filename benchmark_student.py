@@ -157,7 +157,7 @@ def benchmark_cutile_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
         print("Applying baseline configuration (example)...")
         layers = importlib.import_module("layers")
         layers.Linear.BACKEND = 'cublas'
-        layers.MLP.FUSED = False
+        layers.MLP.FUSED = True
         if hasattr(layers, 'AudioMLP'):
             layers.AudioMLP.FUSED = False
     print(f"Loading model from {folder_name}...")
