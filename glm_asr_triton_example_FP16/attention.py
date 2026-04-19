@@ -5,6 +5,7 @@ End-to-end implementation using Triton kernels
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from typing import Optional, Tuple
@@ -260,6 +261,70 @@ def next_power_of_two(x: int) -> int:
 MAX_ATTENTION_DIM = 256
 
 
+def _prepare_sdpa_mask(
+    attention_mask: Optional[torch.Tensor],
+    batch: int,
+    num_heads: int,
+    seq_q: int,
+    seq_k: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    is_causal: bool,
+) -> Tuple[Optional[torch.Tensor], bool]:
+    """Normalize masks for PyTorch SDPA without forcing a full score tensor."""
+    if attention_mask is None:
+        return None, is_causal
+
+    mask = attention_mask.to(device=device)
+
+    if mask.ndim == 2:
+        mask = mask[:, None, None, :]
+    elif mask.ndim == 3:
+        mask = mask[:, None, :, :]
+    elif mask.ndim != 4:
+        raise ValueError(
+            f"attention_mask must have 2, 3, or 4 dims, got shape {tuple(mask.shape)}"
+        )
+
+    if mask.shape[0] != batch:
+        raise ValueError(
+            f"attention_mask batch mismatch: expected {batch}, got {mask.shape[0]}"
+        )
+    if mask.shape[1] not in (1, num_heads):
+        raise ValueError(
+            f"attention_mask head dimension must be 1 or {num_heads}, got {mask.shape[1]}"
+        )
+
+    if mask.shape[2] not in (1, seq_q):
+        raise ValueError(
+            f"attention_mask query dimension must be 1 or {seq_q}, got {mask.shape[2]}"
+        )
+    if mask.shape[3] != seq_k:
+        raise ValueError(
+            f"attention_mask key dimension mismatch: expected {seq_k}, got {mask.shape[3]}"
+        )
+
+    if mask.dtype == torch.bool:
+        if is_causal:
+            causal = torch.ones((seq_q, seq_k), dtype=torch.bool, device=device).tril()
+            mask = mask & causal.view(1, 1, seq_q, seq_k)
+            is_causal = False
+        return mask, is_causal
+
+    mask = mask.to(dtype=dtype)
+
+    if is_causal:
+        causal = torch.full((seq_q, seq_k), 0.0, dtype=dtype, device=device)
+        causal = causal.masked_fill(
+            torch.triu(torch.ones((seq_q, seq_k), dtype=torch.bool, device=device), diagonal=1),
+            torch.finfo(dtype).min,
+        )
+        mask = mask + causal.view(1, 1, seq_q, seq_k)
+        is_causal = False
+
+    return mask, is_causal
+
+
 def scaled_dot_product_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -295,20 +360,20 @@ def scaled_dot_product_attention(
     )
 
     if use_triton:
-        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32)
-        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
-        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
+        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).contiguous()
+        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).contiguous()
+        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).contiguous()
 
         if seq_k_padded != seq_k or head_dim_padded != head_dim:
             k_padded = torch.zeros(
                 (batch * num_heads, seq_k_padded, head_dim_padded),
-                dtype=torch.float32,
+                dtype=attn_dtype,
                 device=q.device,
             )
             v_padded = torch.zeros_like(k_padded)
             q_padded = torch.zeros(
                 (batch * num_heads, seq_q, head_dim_padded),
-                dtype=torch.float32,
+                dtype=attn_dtype,
                 device=q.device,
             )
             k_padded[:, :seq_k, :head_dim] = k_flat
@@ -325,7 +390,7 @@ def scaled_dot_product_attention(
         )
         output = torch.empty(
             (batch * num_heads, seq_q, head_dim_padded),
-            dtype=torch.float32,
+            dtype=attn_dtype,
             device=q.device,
         )
 
@@ -351,20 +416,20 @@ def scaled_dot_product_attention(
         )
 
         if seq_k_padded != seq_k:
-            scores[:, :, seq_k:] = -1e9
+            scores[:, :, seq_k:] = torch.finfo(scores.dtype).min
 
         if is_causal:
             mask = torch.triu(
-                torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device),
+                torch.ones((seq_q, seq_k_padded), dtype=torch.bool, device=q.device),
                 diagonal=1,
-            ) * -1e9
-            scores = scores + mask[None, :, :]
+            )
+            scores = scores.masked_fill(mask[None, :, :], torch.finfo(scores.dtype).min)
 
         if attention_mask is not None:
             if attention_mask.ndim == 4:
-                attention_mask = attention_mask.reshape(
-                    batch * num_heads, seq_q, seq_k
-                )
+                if attention_mask.shape[1] == 1:
+                    attention_mask = attention_mask.expand(batch, num_heads, seq_q, seq_k)
+                attention_mask = attention_mask.reshape(batch * num_heads, seq_q, seq_k)
             if attention_mask.dtype != scores.dtype:
                 attention_mask = attention_mask.to(scores.dtype)
             if seq_k_padded != seq_k:
@@ -374,7 +439,7 @@ def scaled_dot_product_attention(
                     device=q.device,
                 )
                 mask_padded[:, :, :seq_k] = attention_mask
-                mask_padded[:, :, seq_k:] = -1e9
+                mask_padded[:, :, seq_k:] = torch.finfo(scores.dtype).min
                 attention_mask = mask_padded
             scores = scores + attention_mask
 
@@ -409,14 +474,35 @@ def scaled_dot_product_attention(
 
         return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
 
+    if hasattr(F, "scaled_dot_product_attention"):
+        sdpa_mask, sdpa_is_causal = _prepare_sdpa_mask(
+            attention_mask,
+            batch,
+            num_heads,
+            seq_q,
+            seq_k,
+            q.device,
+            attn_dtype,
+            is_causal,
+        )
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=sdpa_mask,
+            dropout_p=0.0,
+            is_causal=sdpa_is_causal,
+            scale=scale,
+        ).to(q.dtype)
+
     scores = torch.einsum("bnqd,bnkd->bnqk", q, k) * scale
 
     if is_causal:
         mask = torch.triu(
-            torch.ones((seq_q, seq_k), dtype=scores.dtype, device=q.device),
+            torch.ones((seq_q, seq_k), dtype=torch.bool, device=q.device),
             diagonal=1,
-        ) * -1e9
-        scores = scores + mask[None, None, :, :]
+        )
+        scores = scores.masked_fill(mask[None, None, :, :], torch.finfo(scores.dtype).min)
 
     if attention_mask is not None:
         if attention_mask.dtype != scores.dtype:

@@ -317,7 +317,7 @@ def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < n_cols
 
-    x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=-float("inf"))
+    x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=-float("inf")).to(tl.float32)
     x = x - tl.max(x, axis=0)
     exp_x = tl.exp(x)
     denom = tl.sum(exp_x, axis=0)
@@ -489,7 +489,6 @@ class RMSNorm:
         if self.use_triton and x.is_cuda:
             batch_size = int(np.prod(x.shape[:-1]))
             x_flat = x.reshape(batch_size, self.hidden_size).contiguous()
-            x_flat = x_flat.to(torch.float32)
             output = torch.empty_like(x_flat)
 
             if self.weight.device != x.device:
@@ -532,7 +531,6 @@ class LayerNorm:
         if self.use_triton and x.is_cuda:
             batch_size = int(np.prod(x.shape[:-1]))
             x_flat = x.reshape(batch_size, self.hidden_size).contiguous()
-            x_flat = x_flat.to(torch.float32)
             output = torch.empty_like(x_flat)
 
             if self.weight.device != x.device:
@@ -571,7 +569,7 @@ def gelu(x: torch.Tensor) -> torch.Tensor:
     total = int(np.prod(x.shape))
     block = 256
 
-    x_flat = x.reshape(-1).contiguous().to(torch.float32)
+    x_flat = x.reshape(-1).contiguous()
     output = torch.empty_like(x_flat)
     grid = (triton.cdiv(total, block),)
 
@@ -588,7 +586,7 @@ def silu(x: torch.Tensor) -> torch.Tensor:
     total = int(np.prod(x.shape))
     block = 256
 
-    x_flat = x.reshape(-1).contiguous().to(torch.float32)
+    x_flat = x.reshape(-1).contiguous()
     output = torch.empty_like(x_flat)
     grid = (triton.cdiv(total, block),)
 
@@ -793,7 +791,7 @@ def softmax(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
     batch_size = int(np.prod(x.shape[:-1]))
     seq_len = x.shape[-1]
 
-    x_flat = x.reshape(batch_size, seq_len).to(torch.float32).contiguous()
+    x_flat = x.reshape(batch_size, seq_len).contiguous()
     output = torch.empty_like(x_flat)
 
     if x.is_cuda:
@@ -852,10 +850,8 @@ class MLP:
         if self._gate_weight_t is None and self.use_gating:
             if self.gate_proj.weight.device != self.up_proj.weight.device:
                 self.up_proj.weight = self.up_proj.weight.to(self.gate_proj.weight.device)
-            # Match the fused kernel's float32 activation path so tl.dot sees
-            # a consistent compute dtype even when checkpoint weights are FP16.
-            self._gate_weight_t = self.gate_proj.weight.t().to(torch.float32).contiguous()
-            self._up_weight_t = self.up_proj.weight.t().to(torch.float32).contiguous()
+            self._gate_weight_t = self.gate_proj.weight.t().contiguous()
+            self._up_weight_t = self.up_proj.weight.t().contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_gating and MLP.FUSED and x.is_cuda:
@@ -879,7 +875,10 @@ class MLP:
         self._prepare_fused_weights()
 
         orig_shape = x.shape
-        x_2d = x.reshape(-1, self.hidden_size).to(torch.float32).contiguous()
+        fused_dtype = self.gate_proj.weight.dtype
+        x_2d = x.reshape(-1, self.hidden_size).contiguous()
+        if x_2d.dtype != fused_dtype:
+            x_2d = x_2d.to(fused_dtype)
         M = x_2d.shape[0]
         K = self.hidden_size
         N = self.intermediate_size
@@ -890,7 +889,7 @@ class MLP:
 
         if M != M_pad or K != K_pad:
             x_padded = torch.zeros(
-                (M_pad, K_pad), dtype=torch.float32, device=x.device
+                (M_pad, K_pad), dtype=fused_dtype, device=x.device
             )
             x_padded[:M, :K] = x_2d
         else:
@@ -898,11 +897,11 @@ class MLP:
 
         if K != K_pad or N != N_pad:
             gate_w_padded = torch.zeros(
-                (K_pad, N_pad), dtype=torch.float32, device=x.device
+                (K_pad, N_pad), dtype=fused_dtype, device=x.device
             )
             gate_w_padded[:K, :N] = self._gate_weight_t
             up_w_padded = torch.zeros(
-                (K_pad, N_pad), dtype=torch.float32, device=x.device
+                (K_pad, N_pad), dtype=fused_dtype, device=x.device
             )
             up_w_padded[:K, :N] = self._up_weight_t
         else:
@@ -910,7 +909,7 @@ class MLP:
             up_w_padded = self._up_weight_t
 
         intermediate = torch.zeros(
-            (M_pad, N_pad), dtype=torch.float32, device=x.device
+            (M_pad, N_pad), dtype=fused_dtype, device=x.device
         )
 
         grid = (
@@ -971,9 +970,7 @@ class EncoderMLP:
     def _prepare_fused_weights(self):
         """Prepare pre-transposed weights for fused kernel."""
         if self._fc1_weight_t is None:
-            # Keep the fused Linear+GELU path aligned with the float32 input
-            # activations prepared in _forward_fused.
-            self._fc1_weight_t = self.fc1.weight.t().to(torch.float32).contiguous()
+            self._fc1_weight_t = self.fc1.weight.t().contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if EncoderMLP.FUSED and self.activation == "gelu" and x.is_cuda:
@@ -992,7 +989,10 @@ class EncoderMLP:
         self._prepare_fused_weights()
 
         orig_shape = x.shape
-        x_2d = x.reshape(-1, self.hidden_size).to(torch.float32).contiguous()
+        fused_dtype = self.fc1.weight.dtype
+        x_2d = x.reshape(-1, self.hidden_size).contiguous()
+        if x_2d.dtype != fused_dtype:
+            x_2d = x_2d.to(fused_dtype)
         M = x_2d.shape[0]
         K = self.hidden_size
         N = self.intermediate_size
@@ -1003,7 +1003,7 @@ class EncoderMLP:
 
         if M != M_pad or K != K_pad:
             x_padded = torch.zeros(
-                (M_pad, K_pad), dtype=torch.float32, device=x.device
+                (M_pad, K_pad), dtype=fused_dtype, device=x.device
             )
             x_padded[:M, :K] = x_2d
         else:
@@ -1011,14 +1011,14 @@ class EncoderMLP:
 
         if K != K_pad or N != N_pad:
             fc1_w_padded = torch.zeros(
-                (K_pad, N_pad), dtype=torch.float32, device=x.device
+                (K_pad, N_pad), dtype=fused_dtype, device=x.device
             )
             fc1_w_padded[:K, :N] = self._fc1_weight_t
         else:
             fc1_w_padded = self._fc1_weight_t
 
         intermediate = torch.zeros(
-            (M_pad, N_pad), dtype=torch.float32, device=x.device
+            (M_pad, N_pad), dtype=fused_dtype, device=x.device
         )
 
         grid = (
