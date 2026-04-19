@@ -172,6 +172,39 @@ def linear_kernel_tf32(
 
 
 @triton.jit
+def linear_gemv_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    N,
+    K,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Vector-matrix product specialized for autoregressive decode (M=1)."""
+    pid_n = tl.program_id(0)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+        a = tl.load(a_ptr + offs_k * stride_ak, mask=offs_k < K, other=0.0)
+        b = tl.load(
+            b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+            mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.sum(b * a[:, None], axis=0)
+
+    tl.store(c_ptr + offs_n * stride_cn, acc, mask=offs_n < N)
+
+
+@triton.jit
 def linear_gelu_kernel(
     a_ptr,
     b_ptr,
@@ -613,10 +646,13 @@ class Linear:
     TILE_M = 64
     TILE_N = 64
     TILE_K = 32
+    GEMV_TILE_N = 128
+    GEMV_TILE_K = 32
+    GEMV_MAX_M = 1
 
     BACKEND = "torch"
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True,backend=None):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, backend=None):
         self.in_features = in_features
         self.out_features = out_features
         self.has_bias = bias
@@ -624,53 +660,92 @@ class Linear:
         self.weight = torch.zeros((out_features, in_features), dtype=torch.float32)
         self.bias_param = torch.zeros(out_features, dtype=torch.float32) if bias else None
 
+        self._weight_t = None
         self._weight_t_padded = None
         self._K_padded = None
         self._N_padded = None
+        self._prepared_weight_ptr = None
+        self._prepared_weight_device = None
         self.backend = backend
+
+    def _invalidate_weight_cache(self):
+        """Drop cached transposed/padded weights when the source weight changes."""
+        self._weight_t = None
+        self._weight_t_padded = None
+        self._K_padded = None
+        self._N_padded = None
+        self._prepared_weight_ptr = None
+        self._prepared_weight_device = None
+
+    def _flatten_input(self, x: torch.Tensor) -> Tuple[Tuple[int, ...], Tuple[int, ...], int]:
+        """Return original shape, batch dims, and flattened row count M."""
+        original_shape = x.shape
+        batch_dims = original_shape[:-1]
+        M = int(np.prod(batch_dims)) if len(batch_dims) > 0 else 1
+        return original_shape, batch_dims, M
 
     def _ensure_weight_prepared(self):
         """Cache transposed and padded weight for Triton kernel."""
-        if self._weight_t_padded is None:
-            K = self.in_features
-            N = self.out_features
-            self._K_padded = pad_to_multiple(K, self.TILE_K)
-            self._N_padded = pad_to_multiple(N, self.TILE_N)
+        weight_ptr = self.weight.data_ptr()
+        weight_device = self.weight.device
+        if (
+            self._weight_t_padded is not None
+            and self._prepared_weight_ptr == weight_ptr
+            and self._prepared_weight_device == weight_device
+        ):
+            return
 
-            weight_t = self.weight.t().contiguous()
-            if self._K_padded > K or self._N_padded > N:
-                weight_pad = torch.zeros(
-                    (self._K_padded, self._N_padded),
-                    dtype=torch.float32,
-                    device=weight_t.device,
-                )
-                weight_pad[:K, :N] = weight_t
-                self._weight_t_padded = weight_pad
-            else:
-                self._weight_t_padded = weight_t
+        K = self.in_features
+        N = self.out_features
+        self._K_padded = pad_to_multiple(K, self.TILE_K)
+        self._N_padded = pad_to_multiple(N, self.TILE_N)
+
+        weight_t = self.weight.t().contiguous()
+        self._weight_t = weight_t
+
+        if self._K_padded > K or self._N_padded > N:
+            weight_pad = torch.zeros(
+                (self._K_padded, self._N_padded),
+                dtype=torch.float32,
+                device=weight_t.device,
+            )
+            weight_pad[:K, :N] = weight_t
+            self._weight_t_padded = weight_pad
+        else:
+            self._weight_t_padded = weight_t
+
+        self._prepared_weight_ptr = weight_ptr
+        self._prepared_weight_device = weight_device
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         backend = self.backend if self.backend is not None else Linear.BACKEND
-    
+        _, _, M = self._flatten_input(x)
+
+        # Explicit Triton backend should still remain usable in CPU-only smoke tests.
+        if not x.is_cuda:
+            return self._forward_torch(x)
+
         if backend in ("torch", "cublas"):
             return self._forward_torch(x)
+        if backend == "triton_gemm":
+            return self._forward_triton_gemm(x)
+        if backend == "triton_gemv":
+            return self._forward_triton_gemv(x)
         if backend == "triton":
-            return self._forward_triton(x)
+            if M <= self.GEMV_MAX_M:
+                return self._forward_triton_gemv(x)
+            return self._forward_triton_gemm(x)
 
-        if M >= self.TILE_M and x.is_cuda:
-            return self._forward_triton(x)
-        return self._forward_torch(x)
+        raise ValueError(f"Unknown Linear backend: {backend}")
 
     def _forward_torch(self, x: torch.Tensor) -> torch.Tensor:
         """Torch matmul backend."""
-        original_shape = x.shape
-        batch_dims = original_shape[:-1]
-
-        M = int(np.prod(batch_dims))
+        original_shape, batch_dims, M = self._flatten_input(x)
         x_2d = x.reshape(M, self.in_features).to(torch.float32)
 
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
+            self._invalidate_weight_cache()
         output = x_2d @ self.weight.t()
 
         if self.has_bias and self.bias_param is not None:
@@ -680,12 +755,9 @@ class Linear:
 
         return output.reshape(*batch_dims, self.out_features)
 
-    def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
-        """Triton matmul backend."""
-        original_shape = x.shape
-        batch_dims = original_shape[:-1]
-
-        M = int(np.prod(batch_dims))
+    def _forward_triton_gemm(self, x: torch.Tensor) -> torch.Tensor:
+        """Triton GEMM backend for prefill / batched rows."""
+        original_shape, batch_dims, M = self._flatten_input(x)
         K = self.in_features
         N = self.out_features
 
@@ -693,7 +765,7 @@ class Linear:
 
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
-            self._weight_t_padded = None
+            self._invalidate_weight_cache()
         self._ensure_weight_prepared()
 
         M_padded = pad_to_multiple(M, self.TILE_M)
@@ -735,6 +807,44 @@ class Linear:
         )
 
         output = output[:M, :N]
+
+        if self.has_bias and self.bias_param is not None:
+            if self.bias_param.device != x.device:
+                self.bias_param = self.bias_param.to(x.device)
+            output = output + self.bias_param
+
+        return output.reshape(*batch_dims, self.out_features)
+
+    def _forward_triton_gemv(self, x: torch.Tensor) -> torch.Tensor:
+        """Triton GEMV backend specialized for single-row decode."""
+        original_shape, batch_dims, M = self._flatten_input(x)
+        if M != 1:
+            return self._forward_triton_gemm(x)
+
+        K = self.in_features
+        N = self.out_features
+        x_vec = x.reshape(K).to(torch.float32).contiguous()
+
+        if self.weight.device != x.device:
+            self.weight = self.weight.to(x.device)
+            self._invalidate_weight_cache()
+        self._ensure_weight_prepared()
+
+        output = torch.empty((N,), dtype=torch.float32, device=x.device)
+        grid = (triton.cdiv(N, self.GEMV_TILE_N),)
+        linear_gemv_kernel[grid](
+            x_vec,
+            self._weight_t,
+            output,
+            N,
+            K,
+            x_vec.stride(0),
+            self._weight_t.stride(0),
+            self._weight_t.stride(1),
+            output.stride(0),
+            BLOCK_N=self.GEMV_TILE_N,
+            BLOCK_K=self.GEMV_TILE_K,
+        )
 
         if self.has_bias and self.bias_param is not None:
             if self.bias_param.device != x.device:
@@ -830,20 +940,30 @@ class MLP:
         activation: str = "silu",
         bias: bool = False,
         use_gating: bool = True,
+        linear_backend: Optional[str] = None,
     ):
         self.use_gating = use_gating
         self.act_fn = get_activation(activation)
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.bias_enabled = bias
+        self.linear_backend = linear_backend
 
         if use_gating:
-            self.gate_proj = Linear(hidden_size, intermediate_size, bias=bias)
-            self.up_proj = Linear(hidden_size, intermediate_size, bias=bias)
+            self.gate_proj = Linear(
+                hidden_size, intermediate_size, bias=bias, backend=linear_backend
+            )
+            self.up_proj = Linear(
+                hidden_size, intermediate_size, bias=bias, backend=linear_backend
+            )
         else:
-            self.up_proj = Linear(hidden_size, intermediate_size, bias=bias)
+            self.up_proj = Linear(
+                hidden_size, intermediate_size, bias=bias, backend=linear_backend
+            )
 
-        self.down_proj = Linear(intermediate_size, hidden_size, bias=bias)
+        self.down_proj = Linear(
+            intermediate_size, hidden_size, bias=bias, backend=linear_backend
+        )
 
         self._gate_weight_t = None
         self._up_weight_t = None
