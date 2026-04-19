@@ -850,8 +850,10 @@ class MLP:
         if self._gate_weight_t is None and self.use_gating:
             if self.gate_proj.weight.device != self.up_proj.weight.device:
                 self.up_proj.weight = self.up_proj.weight.to(self.gate_proj.weight.device)
-            self._gate_weight_t = self.gate_proj.weight.t().contiguous()
-            self._up_weight_t = self.up_proj.weight.t().contiguous()
+            # Match the fused kernel's float32 activation path so tl.dot sees
+            # a consistent compute dtype even when checkpoint weights are FP16.
+            self._gate_weight_t = self.gate_proj.weight.t().to(torch.float32).contiguous()
+            self._up_weight_t = self.up_proj.weight.t().to(torch.float32).contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_gating and MLP.FUSED and x.is_cuda:
@@ -967,7 +969,9 @@ class EncoderMLP:
     def _prepare_fused_weights(self):
         """Prepare pre-transposed weights for fused kernel."""
         if self._fc1_weight_t is None:
-            self._fc1_weight_t = self.fc1.weight.t().contiguous()
+            # Keep the fused Linear+GELU path aligned with the float32 input
+            # activations prepared in _forward_fused.
+            self._fc1_weight_t = self.fc1.weight.t().to(torch.float32).contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if EncoderMLP.FUSED and self.activation == "gelu" and x.is_cuda:
