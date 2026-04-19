@@ -51,7 +51,7 @@ def apply_example_baseline_config(folder_name: str):
 
     print("Applying baseline configuration (example)...")
     layers = importlib.import_module("layers")
-    layers.Linear.BACKEND = "triton" #"cublas"
+    #layers.Linear.BACKEND = "triton" #"cublas"
     layers.MLP.FUSED = True
     if hasattr(layers, "EncoderMLP"):
         layers.EncoderMLP.FUSED = False
