@@ -1,4 +1,4 @@
-## Config：全局默认 cuBLAS，Projector/Decoder 显式走 Triton 分流
+## Config：Encoder / MLP 走 Triton，Decoder 走 cuBLAS + GEMV 分流
 
 
 ```
@@ -11,10 +11,12 @@ Mixed execution:
 - Projector overrides:
   - `linear_1`, `linear_2` use `backend="triton"`
   - shape `M≈375` -> Triton GEMM
+- Audio encoder overrides:
+  - encoder attention/MLP linears use `backend="triton"`
 - Decoder overrides:
-  - `q_proj/k_proj/v_proj/o_proj`, decoder MLP linears, `lm_head` use `backend="triton"`
-  - shape `M=1` -> Triton GEMV
-  - shape `M>1` -> Triton GEMM
+  - `q_proj/k_proj/v_proj/o_proj`, decoder MLP linears, `lm_head` use `backend="cublas"`
+  - shape `M=1` -> cuBLAS GEMV (`torch.mv`)
+  - shape `M>1` -> cuBLAS GEMM / matmul
 - RMSNorm / LayerNorm: Triton when hidden_size is power-of-two and x.is_cuda
 - gelu / silu: Triton when x.is_cuda
 - Attention Triton path:
@@ -31,4 +33,3 @@ Mixed execution:
 - Conv: Triton only when shape constraints are satisfied
 
 ```
-

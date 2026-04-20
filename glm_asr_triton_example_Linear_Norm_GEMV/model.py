@@ -226,15 +226,15 @@ class DecoderLayer:
         self.post_attention_layernorm = RMSNorm(hidden_size)
 
         # Attention projections (no bias for Llama-style)
-        self.q_proj = Linear(hidden_size, num_heads * self.head_dim, bias=False, backend="triton")
-        self.k_proj = Linear(hidden_size, num_kv_heads * self.head_dim, bias=False, backend="triton")
-        self.v_proj = Linear(hidden_size, num_kv_heads * self.head_dim, bias=False, backend="triton")
-        self.o_proj = Linear(num_heads * self.head_dim, hidden_size, bias=False, backend="triton")
+        self.q_proj = Linear(hidden_size, num_heads * self.head_dim, bias=False, backend="cublas")
+        self.k_proj = Linear(hidden_size, num_kv_heads * self.head_dim, bias=False, backend="cublas")
+        self.v_proj = Linear(hidden_size, num_kv_heads * self.head_dim, bias=False, backend="cublas")
+        self.o_proj = Linear(num_heads * self.head_dim, hidden_size, bias=False, backend="cublas")
 
         # MLP (SwiGLU)
         self.mlp = MLP(
             hidden_size, intermediate_size,
-            activation="silu", use_gating=True, linear_backend="triton"
+            activation="silu", use_gating=True, linear_backend="cublas"
         )
 
         # Attention handler

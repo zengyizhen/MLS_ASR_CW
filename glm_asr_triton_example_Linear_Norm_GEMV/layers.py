@@ -725,7 +725,11 @@ class Linear:
         if not x.is_cuda:
             return self._forward_torch(x)
 
-        if backend in ("torch", "cublas"):
+        if backend == "torch":
+            return self._forward_torch(x)
+        if backend == "cublas":
+            if M <= self.GEMV_MAX_M:
+                return self._forward_cublas_gemv(x)
             return self._forward_torch(x)
         if backend == "triton_gemm":
             return self._forward_triton_gemm(x)
@@ -747,6 +751,27 @@ class Linear:
             self.weight = self.weight.to(x.device)
             self._invalidate_weight_cache()
         output = x_2d @ self.weight.t()
+
+        if self.has_bias and self.bias_param is not None:
+            if self.bias_param.device != x.device:
+                self.bias_param = self.bias_param.to(x.device)
+            output = output + self.bias_param
+
+        return output.reshape(*batch_dims, self.out_features)
+
+    def _forward_cublas_gemv(self, x: torch.Tensor) -> torch.Tensor:
+        """CUDA library GEMV backend for single-row decode."""
+        original_shape, batch_dims, M = self._flatten_input(x)
+        if M != 1:
+            return self._forward_torch(x)
+
+        x_vec = x.reshape(self.in_features).to(torch.float32)
+
+        if self.weight.device != x.device:
+            self.weight = self.weight.to(x.device)
+            self._invalidate_weight_cache()
+
+        output = torch.mv(self.weight, x_vec)
 
         if self.has_bias and self.bias_param is not None:
             if self.bias_param.device != x.device:
