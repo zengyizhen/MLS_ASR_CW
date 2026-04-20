@@ -640,7 +640,7 @@ class GlmAsrModel:
         self.text_decoder = TextDecoder(config)
 
         # LM head (tied with embedding)
-        self.lm_head = Linear(config.text_hidden_size, config.text_vocab_size, bias=False, backend="triton")
+        self.lm_head = Linear(config.text_hidden_size, config.text_vocab_size, bias=False, backend="cublas")
 
     def encode_audio(
         self,
