@@ -298,6 +298,102 @@ def flash_attention_v2_fwd_kernel(
     )
 
 
+@triton.jit
+def flash_decode_gqa_fwd_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    out_ptr,
+    scale,
+    seq_k,
+    head_dim,
+    queries_per_kv,
+    stride_qb,
+    stride_qh,
+    stride_qs,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_ks,
+    stride_kd,
+    stride_vb,
+    stride_vh,
+    stride_vs,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_os,
+    stride_od,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    Flash-Decoding style GQA kernel for q_len=1 decoder steps.
+    Grid: (batch, query_heads)
+    """
+    pid_b = tl.program_id(0)
+    pid_qh = tl.program_id(1)
+    pid_kvh = pid_qh // queries_per_kv
+
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    q = tl.load(
+        q_ptr
+        + pid_b * stride_qb
+        + pid_qh * stride_qh
+        + offs_d * stride_qd,
+        mask=offs_d < head_dim,
+        other=0.0,
+    )
+
+    # q_len=1 的 decoder attention 不写出 scores，直接在线更新 softmax。
+    m_i = tl.full((), -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros((), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+    for start_n in tl.range(0, seq_k, BLOCK_N):
+        k_offsets = start_n + offs_n
+        k = tl.load(
+            k_ptr
+            + pid_b * stride_kb
+            + pid_kvh * stride_kh
+            + k_offsets[:, None] * stride_ks
+            + offs_d[None, :] * stride_kd,
+            mask=(k_offsets[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+            other=0.0,
+        )
+        scores = tl.sum(k.to(tl.float32) * q[None, :].to(tl.float32), axis=1) * scale
+        scores = tl.where(k_offsets < seq_k, scores, -float("inf"))
+
+        m_new = tl.maximum(m_i, tl.max(scores, axis=0))
+        p = tl.exp(scores - m_new)
+        alpha = tl.exp(m_i - m_new)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+
+        v = tl.load(
+            v_ptr
+            + pid_b * stride_vb
+            + pid_kvh * stride_vh
+            + k_offsets[:, None] * stride_vs
+            + offs_d[None, :] * stride_vd,
+            mask=(k_offsets[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+            other=0.0,
+        )
+        acc = acc * alpha + tl.sum(p[:, None] * v.to(tl.float32), axis=0)
+        m_i = m_new
+
+    out = acc / l_i
+    tl.store(
+        out_ptr
+        + pid_b * stride_ob
+        + pid_qh * stride_oh
+        + offs_d * stride_od,
+        out,
+        mask=offs_d < head_dim,
+    )
+
+
 # ============================================================================
 # Attention Classes
 # ============================================================================
@@ -344,6 +440,11 @@ class MultiHeadAttention:
         batch, num_heads, seq_q, head_dim = q.shape
         _, num_kv_heads, seq_k, _ = k.shape
 
+        if _can_use_flash_decode_gqa(q, k, v, attention_mask):
+            # Decoder q_len=1 + GQA：直接用 query head 映射到 KV head，
+            # 避免把 4 个 KV heads 物理 expand 成 28 个 query heads。
+            return _flash_decode_gqa_triton(q, k, v, self.scale)
+
         if num_kv_heads != num_heads:
             k = self._expand_kv(k, self.num_queries_per_kv)
             v = self._expand_kv(v, self.num_queries_per_kv)
@@ -370,6 +471,7 @@ MAX_ATTENTION_DIM = 256
 FLASH_ATTN_MAX_HEAD_DIM = 128
 FLASH_ATTN_BLOCK_M = 16
 FLASH_ATTN_BLOCK_N = 64
+FLASH_DECODE_BLOCK_N = 64
 
 
 def _can_use_flash_attention_v2(
@@ -446,6 +548,87 @@ def _flash_attention_v2_triton_encoder(
         output.stride(3),
         BLOCK_M=FLASH_ATTN_BLOCK_M,
         BLOCK_N=FLASH_ATTN_BLOCK_N,
+        BLOCK_D=block_d,
+    )
+    return output
+
+
+def _can_use_flash_decode_gqa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+) -> bool:
+    """Check whether this is a q_len=1 decoder GQA step."""
+    if not q.is_cuda:
+        return False
+    if attention_mask is not None:
+        return False
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        return False
+
+    batch, q_heads, seq_q, head_dim = q.shape
+    k_batch, kv_heads, seq_k, k_head_dim = k.shape
+    v_batch, v_heads, seq_v, v_head_dim = v.shape
+
+    # Decoder decode with KV cache: q_len=1, kv_len grows, num_q_heads > num_kv_heads.
+    return (
+        batch == k_batch == v_batch
+        and seq_q == 1
+        and seq_k == seq_v
+        and kv_heads == v_heads
+        and q_heads % kv_heads == 0
+        and head_dim == k_head_dim == v_head_dim
+        and next_power_of_two(head_dim) <= FLASH_ATTN_MAX_HEAD_DIM
+    )
+
+
+def _flash_decode_gqa_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Run q_len=1 Flash-Decoding style GQA attention without expanding KV heads."""
+    batch, q_heads, _, head_dim = q.shape
+    _, kv_heads, seq_k, _ = k.shape
+    queries_per_kv = q_heads // kv_heads
+    block_d = next_power_of_two(head_dim)
+
+    q_contig = q.contiguous()
+    k_contig = k.contiguous()
+    v_contig = v.contiguous()
+    output = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    grid = (batch, q_heads)
+
+    flash_decode_gqa_fwd_kernel[grid](
+        q_contig,
+        k_contig,
+        v_contig,
+        output,
+        float(scale),
+        seq_k,
+        head_dim,
+        queries_per_kv,
+        q_contig.stride(0),
+        q_contig.stride(1),
+        q_contig.stride(2),
+        q_contig.stride(3),
+        k_contig.stride(0),
+        k_contig.stride(1),
+        k_contig.stride(2),
+        k_contig.stride(3),
+        v_contig.stride(0),
+        v_contig.stride(1),
+        v_contig.stride(2),
+        v_contig.stride(3),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        output.stride(3),
+        BLOCK_N=FLASH_DECODE_BLOCK_N,
         BLOCK_D=block_d,
     )
     return output
